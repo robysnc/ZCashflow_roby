@@ -86,6 +86,9 @@ jobs:
           if-no-files-found: error
 
   android:
+    env:
+      # Only this branch gets an ARM64-only APK signed with a disposable test key.
+      ANDROID_TEST_BUILD: ${{ github.ref == 'refs/heads/fix/android-17-local-network-permission' }}
     if: ${{ github.event_name == 'push' || inputs.android }}
     runs-on: ubuntu-22.04
     steps:
@@ -106,10 +109,12 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - name: NDK
+      - name: Android SDK 37 and NDK
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018" "platforms;android-35" "build-tools;35.0.0"
+          (set +o pipefail; yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null)
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018" "platforms;android-37.0" "build-tools;37.0.0"
+          test -f "$ANDROID_HOME/platforms/android-37.0/android.jar"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --list_installed
           echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -119,6 +124,10 @@ jobs:
           workspaces: src-tauri
 
       - run: pnpm install --frozen-lockfile
+      - name: Android setup and APK verification script tests
+        run: |
+          node --test scripts/android-setup.test.mjs
+          python3 scripts/android-ci.test.py
       - name: Init Android project
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
@@ -126,18 +135,26 @@ jobs:
         run: |
           pnpm tauri android init --ci
           pnpm tauri icon src-tauri/icons/source/icon.png
-          if [ -n "$KEYSTORE_B64" ]; then
+          if [ "$ANDROID_TEST_BUILD" != "true" ] && [ -n "$KEYSTORE_B64" ]; then
             echo "$KEYSTORE_B64" | base64 -d > src-tauri/gen/android/release.jks
             printf 'keyAlias=zcashflow\npassword=%s\nstoreFile=release.jks\n' "$KEY_PASSWORD" > src-tauri/gen/android/keystore.properties
           fi
           pnpm android:setup
-      - name: Build APK
-        run: pnpm tauri android build --apk --target aarch64 --target armv7
+          python3 scripts/android-ci.py configure
+      - name: Build APK (SDK 37; ARM64 only for network test)
+        run: |
+          if [ "$ANDROID_TEST_BUILD" = "true" ]; then
+            pnpm tauri android build --apk --target aarch64
+          else
+            pnpm tauri android build --apk --target aarch64 --target armv7
+          fi
+      - name: Verify final APK manifest, SDKs and signature
+        run: python3 scripts/android-ci.py package
 
       - uses: actions/upload-artifact@v4
         with:
-          name: zcashflow-android
-          path: src-tauri/gen/android/app/build/outputs/apk/**/release/*.apk
+          name: ${{ env.ANDROID_TEST_BUILD == 'true' && 'zcashflow-android-sdk37-arm64-TEST-SIGNED' || 'zcashflow-android' }}
+          path: android-artifacts/
           if-no-files-found: error
 
   ios:

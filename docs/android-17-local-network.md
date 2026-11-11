@@ -71,11 +71,11 @@ pnpm tauri android build --apk --target aarch64
 ```
 
 Confirm **compile SDK and target SDK 37** in the generated Android project before
-building the Android 17 test APK. The existing build workflow explicitly
-installs platform 35; its SDK provisioning has not been upgraded by this fix.
-Use a compatible SDK/AGP/NDK setup for your SDK 37 build. Confirm the merged APK
-manifest includes `ACCESS_LOCAL_NETWORK`, `CHANGE_WIFI_MULTICAST_STATE`, and
-package `dev.zcashflow.app`.
+building the Android 17 test APK. The GitHub Actions workflow now installs SDK
+platform 37.0 and build tools 37.0.0, sets the generated Gradle compileSdk and
+targetSdk to 37, and verifies their effective values during Gradle preBuild.
+It also verifies both SDK values, the package and permissions in the final APK.
+The Gradle check report and APK inspection reports are included in the artifact.
 
 On the Galaxy Z Fold 8 / Android 17, test:
 
@@ -100,3 +100,53 @@ On the Galaxy Z Fold 8 / Android 17, test:
 
 Windows firewall/Wi-Fi client isolation and device-specific behavior remain
 separate possible causes if permission is granted but LAN traffic still fails.
+
+
+## GitHub Actions test APK on the permission-fix branch
+
+Run the existing **Build** workflow with branch
+`fix/android-17-local-network-permission`, Android enabled and Linux, Windows,
+macOS and iOS disabled. No change to `main` is required. If GitHub Actions has
+not yet been enabled on this fork, enable it first in the repository's Actions
+tab. No tag or GitHub release is required or created by this branch run.
+
+```sh
+gh workflow run build.yml --repo robysnc/ZCashflow_roby \
+  --ref fix/android-17-local-network-permission \
+  -f linux=false -f windows=false -f macos=false -f android=true -f ios=false
+```
+
+On this exact branch the Android job builds **aarch64/arm64-v8a only**, retaining
+the release build configuration. It does not use the repository's release
+keystore. Instead it aligns and signs the APK with a newly generated temporary
+test key, verifies the signature and inspects the final APK. The private test
+key is deleted and is never included in the artifact. On other refs the existing
+ARM64 + ARMv7 targets and repository release signing behavior are retained.
+Desktop and iOS job definitions and release triggers are unchanged.
+
+Download artifact **zcashflow-android-sdk37-arm64-TEST-SIGNED** from the successful
+run's summary. It contains the APK, effective Gradle SDK report, manifest/badging
+report, public signing certificate fingerprints, SHA256SUMS, verification.json,
+and README.md. Upload happens only after verification succeeds.
+
+**This test APK is signed, but its signature differs from the official app.**
+The package ID remains `dev.zcashflow.app`, so it cannot update the official app
+in place, or replace a test APK signed by a different run. Export your data before
+any uninstall: uninstalling can erase the local database and receipt files.
+No uninstall or installation is performed by this workflow.
+
+Local checks for the build changes:
+
+```sh
+python3 scripts/android-ci.test.py
+node --test scripts/android-setup.test.mjs
+```
+
+
+The build-workflow changes were checked locally with 6 Python unit tests,
+4 Android setup tests, actionlint and `git diff --check`. An additional smoke
+check exercised alignment, temporary-key signing, final manifest/SDK/ABI
+inspection, signature verification and report generation using official SDK
+37 build tools on a small synthetic APK fixture. That fixture is not ZCashflow
+and is not distributed as a test application. A successful GitHub Actions
+run is still required to produce the actual ZCashflow APK.
