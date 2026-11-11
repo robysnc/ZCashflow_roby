@@ -12,15 +12,48 @@ import subprocess
 ROOT = Path("src-tauri/gen/android")
 SDK_TASK = r'''
 // zcashflow-ci-sdk-check
-val verifyAndroid37 by tasks.registering {
-    doLast {
-        check(android.compileSdk == 37) { "Expected compileSdk 37, got ${android.compileSdk}" }
-        check(android.defaultConfig.targetSdk == 37) { "Expected targetSdk 37, got ${android.defaultConfig.targetSdk}" }
-        check(android.buildToolsVersion == "37.0.0") { "Expected build tools 37.0.0" }
-        val report = layout.buildDirectory.file("reports/android-sdk.txt").get().asFile
+@org.gradle.api.tasks.CacheableTask
+abstract class VerifyAndroid37 : org.gradle.api.DefaultTask() {
+    @get:org.gradle.api.tasks.Input
+    abstract val compileSdkValue: org.gradle.api.provider.Property<Int>
+
+    @get:org.gradle.api.tasks.Input
+    abstract val targetSdkValue: org.gradle.api.provider.Property<Int>
+
+    @get:org.gradle.api.tasks.Input
+    abstract val buildToolsValue: org.gradle.api.provider.Property<String>
+
+    @get:org.gradle.api.tasks.OutputFile
+    abstract val reportFile: org.gradle.api.file.RegularFileProperty
+
+    @org.gradle.api.tasks.TaskAction
+    fun verify() {
+        val compileSdk = compileSdkValue.get()
+        val targetSdk = targetSdkValue.get()
+        val buildTools = buildToolsValue.get()
+        check(compileSdk == 37) { "Expected compileSdk 37, got $compileSdk" }
+        check(targetSdk == 37) { "Expected targetSdk 37, got $targetSdk" }
+        check(buildTools == "37.0.0") { "Expected build tools 37.0.0, got $buildTools" }
+        val report = reportFile.get().asFile
         report.parentFile.mkdirs()
-        report.writeText("compileSdk=${android.compileSdk}\ntargetSdk=${android.defaultConfig.targetSdk}\nbuildTools=${android.buildToolsVersion}\n")
-        println(report.readText())
+        report.writeText("compileSdk=$compileSdk\ntargetSdk=$targetSdk\nbuildTools=$buildTools\n")
+        logger.lifecycle(report.readText())
+    }
+}
+
+val verifyAndroid37 = tasks.register<VerifyAndroid37>("verifyAndroid37") {
+    reportFile.set(layout.buildDirectory.file("reports/android-sdk.txt"))
+}
+// Snapshot the finalized Android DSL during configuration. The task action only
+// reads serializable inputs/output, never the script, Project or Android DSL.
+androidComponents.finalizeDsl { dsl ->
+    val effectiveCompileSdk = requireNotNull(dsl.compileSdk)
+    val effectiveTargetSdk = requireNotNull(dsl.defaultConfig.targetSdk)
+    val effectiveBuildTools = dsl.buildToolsVersion
+    verifyAndroid37.configure {
+        compileSdkValue.set(effectiveCompileSdk)
+        targetSdkValue.set(effectiveTargetSdk)
+        buildToolsValue.set(effectiveBuildTools)
     }
 }
 tasks.named("preBuild").configure { dependsOn(verifyAndroid37) }
@@ -42,7 +75,15 @@ def configure(root=ROOT):
         source, count = re.subn(r"(?m)^(android\s*\{)\s*$", '\\1\n    buildToolsVersion = "37.0.0"', source)
         if count != 1:
             raise ValueError("Android Gradle block not found")
-    if "// zcashflow-ci-sdk-check" not in source:
+    if "// zcashflow-ci-sdk-check" in source:
+        # Upgrade the earlier doLast task too, without deleting subsequent code.
+        source, count = re.subn(
+            r'\n// zcashflow-ci-sdk-check\n.*?\ntasks\.named\("preBuild"\)\.configure \{ dependsOn\(verifyAndroid37\) \}\n',
+            lambda _: SDK_TASK, source, flags=re.S,
+        )
+        if count != 1:
+            raise ValueError("Unrecognised existing SDK verification task")
+    else:
         source += SDK_TASK
     gradle.write_text(source)
     print("Configured compileSdk=37, targetSdk=37, buildToolsVersion=37.0.0; Gradle preBuild will verify effective values.")
