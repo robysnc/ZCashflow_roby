@@ -2,6 +2,7 @@ name: Build
 
 on:
   push:
+    branches: [fix/android-17-local-network-permission]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -22,7 +23,14 @@ on:
         default: false
 
 jobs:
+  register-workflow:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/fix/android-17-local-network-permission'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Workflow registered; no build requested."
+
   desktop:
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
@@ -89,7 +97,7 @@ jobs:
     env:
       # Only this branch gets an ARM64-only APK signed with a disposable test key.
       ANDROID_TEST_BUILD: ${{ github.ref == 'refs/heads/fix/android-17-local-network-permission' }}
-    if: ${{ github.event_name == 'push' || inputs.android }}
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.android) }}
     runs-on: ubuntu-22.04
     steps:
       - name: Free disk space
@@ -158,7 +166,7 @@ jobs:
           if-no-files-found: error
 
   ios:
-    if: ${{ github.event_name == 'push' || inputs.ios }}
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.ios) }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
