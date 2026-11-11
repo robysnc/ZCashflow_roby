@@ -44,6 +44,10 @@ enum Msg {
 
 pub trait Host: Send + Sync + 'static {
     fn emit(&self, event: &str);
+
+    fn network_allowed(&self) -> bool {
+        true
+    }
 }
 
 struct Session {
@@ -87,6 +91,7 @@ pub struct SyncCore {
     private_key: Vec<u8>,
     public_key: Vec<u8>,
     port: Mutex<u16>,
+    started: Mutex<bool>,
     sessions: Mutex<HashMap<String, Session>>,
     discovered: Mutex<HashMap<String, Discovered>>,
     pairing: Mutex<Option<Pairing>>,
@@ -162,6 +167,14 @@ fn local_addresses() -> Vec<IpAddr> {
 }
 
 impl SyncCore {
+    fn require_network(&self) -> AppResult<()> {
+        if self.host.network_allowed() {
+            Ok(())
+        } else {
+            Err(AppError::Invalid("Local network access is not allowed. Enable Nearby devices in Android Settings to sync.".into()))
+        }
+    }
+
     pub fn new(db: SharedDb, host: Arc<dyn Host>) -> AppResult<Arc<Self>> {
         let (private_key, public_key) = {
             let conn = db.conn();
@@ -181,6 +194,7 @@ impl SyncCore {
             private_key,
             public_key,
             port: Mutex::new(0),
+            started: Mutex::new(false),
             sessions: Mutex::new(HashMap::new()),
             discovered: Mutex::new(HashMap::new()),
             pairing: Mutex::new(None),
@@ -206,7 +220,7 @@ impl SyncCore {
     }
 
     pub fn visible(&self) -> bool {
-        self.enabled() && (self.setting("discoverable").as_deref() != Some("0") || self.active_code().is_some())
+        self.host.network_allowed() && self.enabled() && (self.setting("discoverable").as_deref() != Some("0") || self.active_code().is_some())
     }
 
     pub fn name(&self) -> String {
@@ -214,8 +228,13 @@ impl SyncCore {
     }
 
     pub fn start(self: &Arc<Self>, local_only: bool) -> AppResult<()> {
+        let mut started = self.started.lock().unwrap();
+        if *started || !self.host.network_allowed() {
+            return Ok(());
+        }
         let listener = TcpListener::bind(("0.0.0.0", DEFAULT_PORT)).or_else(|_| TcpListener::bind(("0.0.0.0", 0)))?;
         *self.port.lock().unwrap() = listener.local_addr()?.port();
+        *started = true;
         let me = self.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -271,7 +290,7 @@ impl SyncCore {
 
     pub fn scan_network(self: &Arc<Self>) -> usize {
         use std::sync::atomic::Ordering;
-        if !self.enabled() || self.scanning.swap(true, Ordering::SeqCst) {
+        if !self.host.network_allowed() || !self.enabled() || self.scanning.swap(true, Ordering::SeqCst) {
             return 0;
         }
         self.host.emit("sync-changed");
@@ -340,6 +359,7 @@ impl SyncCore {
     }
 
     pub fn request_pairing(&self, addr: &str) -> AppResult<String> {
+        self.require_network()?;
         let addr = resolve(addr)?;
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(4))?;
         stream.write_all(b"R")?;
@@ -491,6 +511,7 @@ impl SyncCore {
     }
 
     pub fn pair_with(self: &Arc<Self>, addr: &str, code: &str) -> AppResult<String> {
+        self.require_network()?;
         let addr = resolve(addr)?;
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
         stream.write_all(b"P")?;
@@ -569,6 +590,7 @@ impl SyncCore {
     }
 
     fn handle_incoming(self: &Arc<Self>, mut stream: TcpStream) -> AppResult<()> {
+        self.require_network()?;
         if !self.enabled() {
             return Ok(());
         }
@@ -595,6 +617,7 @@ impl SyncCore {
     }
 
     pub fn connect(self: &Arc<Self>, addr: SocketAddr) -> AppResult<()> {
+        self.require_network()?;
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(4))?;
         stream.write_all(b"S")?;
         let (state, remote) = channel::handshake(&mut stream, true, &self.private_key, None)?;
@@ -609,6 +632,9 @@ impl SyncCore {
     }
 
     fn reconnect_paired(self: &Arc<Self>) {
+        if !self.host.network_allowed() {
+            return;
+        }
         if !self.enabled() {
             return;
         }
@@ -855,7 +881,11 @@ impl SyncCore {
             public_key: self.public_hex(),
             fingerprint: fingerprint(&self.public_hex()),
             port: self.port(),
-            addresses: local_addresses().iter().map(|a| format!("{a}:{}", self.port())).collect(),
+            addresses: if self.host.network_allowed() {
+                local_addresses().iter().map(|a| format!("{a}:{}", self.port())).collect()
+            } else {
+                vec![]
+            },
             enabled: self.enabled(),
             discoverable: self.setting("discoverable").as_deref() != Some("0"),
             peers,
@@ -974,6 +1004,48 @@ mod tests {
         )
         .unwrap()
         .id
+    }
+
+    struct PermissionHost(std::sync::atomic::AtomicBool);
+
+    impl Host for PermissionHost {
+        fn emit(&self, _: &str) {}
+        fn network_allowed(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn permission_denial_defers_network_and_grant_starts_once() {
+        let host = Arc::new(PermissionHost(std::sync::atomic::AtomicBool::new(false)));
+        let c = SyncCore::new(Arc::new(Db::open_in_memory().unwrap()), host.clone()).unwrap();
+        c.start(true).unwrap();
+        assert_eq!(c.port(), 0);
+        assert!(!*c.started.lock().unwrap());
+        assert!(c.mdns.lock().unwrap().is_none());
+        assert_eq!(c.scan_network(), 0);
+        assert!(c.status().unwrap().addresses.is_empty());
+        assert!(c.request_pairing("invalid").unwrap_err().to_string().contains("Local network"));
+        assert!(c.pair_with("invalid", "123456").unwrap_err().to_string().contains("Local network"));
+        assert!(c.connect("127.0.0.1:1".parse().unwrap()).unwrap_err().to_string().contains("Local network"));
+
+        host.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Model a concurrent permission callback and vault/database startup.
+        let handles: Vec<_> = (0..4).map(|_| {
+            let c = c.clone();
+            std::thread::spawn(move || c.start(true).unwrap())
+        }).collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let port = c.port();
+        assert_ne!(port, 0);
+        c.start(true).unwrap();
+        assert_eq!(c.port(), port);
+        let peer = core();
+        let code = c.start_pairing();
+        peer.pair_with(&format!("127.0.0.1:{port}"), &code).unwrap();
+        assert!(wait_for(|| c.status().unwrap().peers.iter().any(|p| p.connected)));
     }
 
     #[test]
